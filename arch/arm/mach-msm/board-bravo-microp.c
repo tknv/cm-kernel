@@ -47,6 +47,7 @@
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
 #include <linux/slab.h>
+#include <linux/irq.h>
 
 #include <mach/board-bravo-microp-common.h>
 #include "board-bravo.h"
@@ -128,6 +129,9 @@ static struct file_operations gsensor_log_fops = {
 };
 #endif /* def DEBUG_BMA150 */
 
+static struct mutex gsensor_RW_mutex;
+static struct mutex gsensor_set_mode_mutex;
+
 static int microp_headset_has_mic(void);
 static int microp_enable_headset_plug_event(void);
 static int microp_enable_key_event(void);
@@ -170,7 +174,7 @@ static uint32_t als_kadc;
 static struct wake_lock microp_i2c_wakelock;
 
 static struct i2c_client *private_microp_client;
-static struct microp_oj_callback *oj_callback;
+//static struct microp_oj_callback *oj_callback;
 
 struct microp_int_pin {
 	uint16_t int_gsensor;
@@ -223,6 +227,8 @@ struct microp_i2c_client_data {
 	uint32_t spi_devices;
 	struct mutex microp_i2c_rw_mutex;
 	struct mutex microp_adc_mutex;
+	struct hrtimer gen_irq_timer;
+	uint16_t intr_status;
 };
 
 static char *hex2string(uint8_t *data, int len)
@@ -327,6 +333,11 @@ static int i2c_write_block(struct i2c_client *client, uint8_t addr,
 		mutex_unlock(&cdata->microp_i2c_rw_mutex);
 		return -EIO;
 	}
+	if (addr == MICROP_I2C_WCMD_LCM_BURST_EN) {
+		udelay(500);/*1.5ms for microp SPI write */
+		printk(KERN_ERR "%s: 1.5ms for microp SPI write\n", __func__);
+	}
+
 	mutex_unlock(&cdata->microp_i2c_rw_mutex);
 
 	return 0;
@@ -1310,7 +1321,7 @@ int microp_spi_vote_enable(int spi_device, uint8_t enable) {
 	else
 		enable = 0;
 
-		printk(KERN_ERR "%s: Changing SPI [%d]", __func__, enable);
+	printk(KERN_ERR "%s: Changing SPI [%d]\n", __func__, enable);
 
 	mutex_unlock(&cdata->microp_adc_mutex);
 	ret = microp_spi_enable(enable);
@@ -1321,6 +1332,7 @@ EXPORT_SYMBOL(microp_spi_vote_enable);
 /*
  * OJ callback
  */
+/*
 int microp_register_oj_callback(struct microp_oj_callback *oj)
 {
 	oj_callback = oj;
@@ -1332,21 +1344,24 @@ int microp_register_oj_callback(struct microp_oj_callback *oj)
 
 	return 1;
 }
+*/
 
 /*
  * G-sensor
  */
 static int gsensor_read_reg(uint8_t reg, uint8_t *data)
 {
-	struct i2c_client *client;
+	struct i2c_client *client = private_microp_client;
 	int ret;
 	uint8_t tmp[2];
 
-	client = private_microp_client;
+	mutex_lock(&gsensor_RW_mutex);
+
 	ret = i2c_write_block(client, MICROP_I2C_WCMD_GSENSOR_REG_DATA_REQ,
 			      &reg, 1);
 	if (ret < 0) {
 		dev_err(&client->dev,"%s: i2c_write_block fail\n", __func__);
+		mutex_unlock(&gsensor_RW_mutex);
 		return ret;
 	}
 	msleep(10);
@@ -1354,39 +1369,46 @@ static int gsensor_read_reg(uint8_t reg, uint8_t *data)
 	ret = i2c_read_block(client, MICROP_I2C_RCMD_GSENSOR_REG_DATA, tmp, 2);
 	if (ret < 0) {
 		dev_err(&client->dev,"%s: i2c_read_block fail\n", __func__);
+		mutex_unlock(&gsensor_RW_mutex);
 		return ret;
 	}
 	*data = tmp[1];
+	
+	mutex_unlock(&gsensor_RW_mutex);
+
 	return ret;
 }
 
 static int gsensor_write_reg(uint8_t reg, uint8_t data)
 {
-	struct i2c_client *client;
+	struct i2c_client *client = private_microp_client;
 	int ret;
 	uint8_t tmp[2];
 
-	client = private_microp_client;
+	mutex_lock(&gsensor_RW_mutex);
 
 	tmp[0] = reg;
 	tmp[1] = data;
 	ret = i2c_write_block(client, MICROP_I2C_WCMD_GSENSOR_REG, tmp, 2);
 	if (ret < 0) {
 		dev_err(&client->dev,"%s: i2c_write_block fail\n", __func__);
+		mutex_unlock(&gsensor_RW_mutex);
 		return ret;
 	}
+
+	mutex_unlock(&gsensor_RW_mutex);
 
 	return ret;
 }
 
 static int gsensor_read_acceleration(short *buf)
 {
-	struct i2c_client *client;
+	struct i2c_client *client = private_microp_client;
 	int ret;
 	uint8_t tmp[6];
 	struct microp_i2c_client_data *cdata;
 
-	client = private_microp_client;
+	mutex_lock(&gsensor_RW_mutex);
 
 	cdata = i2c_get_clientdata(client);
 
@@ -1395,6 +1417,7 @@ static int gsensor_read_acceleration(short *buf)
 			      tmp, 1);
 	if (ret < 0) {
 		dev_err(&client->dev,"%s: i2c_write_block fail\n", __func__);
+		mutex_unlock(&gsensor_RW_mutex);
 		return ret;
 	}
 
@@ -1405,6 +1428,7 @@ static int gsensor_read_acceleration(short *buf)
 	if (ret < 0) {
 		dev_err(&client->dev, "%s: i2c_read_block fail\n",
 			__func__);
+		mutex_unlock(&gsensor_RW_mutex);
 		return ret;
 	}
 	buf[0] = (short)(tmp[0] << 8 | tmp[1]);
@@ -1418,6 +1442,9 @@ static int gsensor_read_acceleration(short *buf)
 	/* Log this to debugfs */
 	gsensor_log_status(ktime_get(), buf[0], buf[1], buf[2]);
 #endif
+
+	mutex_unlock(&gsensor_RW_mutex);
+
 	return 1;
 }
 
@@ -1452,22 +1479,28 @@ static int bma150_set_mode(char mode)
 	uint8_t reg;
 	int ret;
 
+	mutex_lock(&gsensor_set_mode_mutex);
+
 	pr_debug("%s mode = %d\n", __func__, mode);
 	if (mode == BMA_MODE_NORMAL)
 		microp_spi_vote_enable(SPI_GSENSOR, 1);
 
-
 	ret = gsensor_read_reg(SMB150_CTRL_REG, &reg);
-	if (ret < 0 )
+	if (ret < 0 ) {
+		mutex_unlock(&gsensor_set_mode_mutex);
 		return -EIO;
+	}
 	reg = (reg & 0xfe) | mode;
 	ret = gsensor_write_reg(SMB150_CTRL_REG, reg);
 
 	if (mode == BMA_MODE_SLEEP)
 		microp_spi_vote_enable(SPI_GSENSOR, 0);
 
+	mutex_unlock(&gsensor_set_mode_mutex);
+
 	return ret;
 }
+
 static int gsensor_read(uint8_t *data)
 {
 	int ret;
@@ -1609,6 +1642,30 @@ static irqreturn_t microp_i2c_intr_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static void microp_int_dispatch(u32 status)
+{
+	unsigned int mask;
+	int irq;
+
+	while (status) {
+		mask = status & -status;
+		irq = fls(mask) - 1;
+		status &= ~mask;
+		generic_handle_irq(FIRST_MICROP_IRQ + irq);
+	}
+}
+
+static enum hrtimer_restart hr_dispath_irq_func(struct hrtimer *data)
+{
+	struct i2c_client *client = private_microp_client;
+	struct microp_i2c_client_data *cdata;
+
+	cdata = i2c_get_clientdata(client);
+	microp_int_dispatch(cdata->intr_status);
+	cdata->intr_status = 0;
+	return HRTIMER_NORESTART;
+}
+
 static void microp_i2c_intr_work_func(struct work_struct *work)
 {
 	struct microp_i2c_work *up_work;
@@ -1617,6 +1674,7 @@ static void microp_i2c_intr_work_func(struct work_struct *work)
 	uint8_t data[3], adc_level;
 	uint16_t intr_status = 0, adc_value, gpi_status = 0;
 	int keycode = 0, ret = 0;
+	ktime_t zero_debounce;
 
 	up_work = container_of(work, struct microp_i2c_work, work);
 	client = up_work->client;
@@ -1637,15 +1695,17 @@ static void microp_i2c_intr_work_func(struct work_struct *work)
 	}
 	pr_debug("intr_status=0x%02x\n", intr_status);
 
+/*
 	if (intr_status & IRQ_OJ) {
 		data[0] = 0x00;
 		if (i2c_write_block(client, MICROP_I2C_WCMD_OJ_INT_STATUS,
 				data, 1) < 0)
 			dev_err(&client->dev, "%s: clear OJ interrupt status fail\n",
 				__func__);
-		if (oj_callback && oj_callback->oj_intr)
-			oj_callback->oj_intr();
+//		if (oj_callback && oj_callback->oj_intr)
+//			oj_callback->oj_intr();
 	}
+*/
 
 	if ((intr_status & IRQ_LSENSOR) || cdata->force_light_sensor_read) {
 		ret = microp_lightsensor_read(&adc_value, &adc_level);
@@ -1683,6 +1743,10 @@ static void microp_i2c_intr_work_func(struct work_struct *work)
 			htc_35mm_key_event(keycode, &cdata->is_hpin_pin_stable);
 		}
 	}
+
+	cdata->intr_status = intr_status;
+	zero_debounce = ktime_set(0, 0);  /* No debounce time */
+	hrtimer_start(&cdata->gen_irq_timer, zero_debounce, HRTIMER_MODE_REL);
 
 	enable_irq(client->irq);
 }
@@ -1778,6 +1842,11 @@ static int microp_function_initialize(struct i2c_client *client)
 		microp_i2c_write_led_mode(client, led_cdev, 0, 0xffff);
 	}
 
+#ifdef CONFIG_OPTICALJOYSTICK_CRUCIAL
+	/* OJ interrupt */
+	interrupts |= IRQ_OJ;
+#endif
+
 	/* enable the interrupts */
 	ret = microp_interrupt_enable(client, interrupts);
 	if (ret < 0) {
@@ -1789,19 +1858,8 @@ static int microp_function_initialize(struct i2c_client *client)
 	microp_read_gpi_status(client, &stat);
 	bravo_microp_sdslot_update_status(stat);
 
-#ifdef CONFIG_INPUT_CRUCIALTEC_OJ
-	/* OJ interrupt */
-	ret = microp_interrupt_enable(client, IRQ_OJ);
-	if (ret < 0) {
-		dev_err(&client->dev, "%s: failed to enable OJ irq\n",
-			__func__);
-		goto err_irq_oj;
-	}
-#endif
-
 	return 0;
 
-err_irq_oj:
 err_irq_en:
 err_gpio_ls:
 	gpio_free(BRAVO_GPIO_LS_EN_N);
@@ -1951,6 +2009,10 @@ static int microp_i2c_probe(struct i2c_client *client,
 	cdata->spi_devices_vote = 0;
 	cdata->spi_devices = SPI_OJ | SPI_GSENSOR;
 
+	cdata->intr_status = 0;
+	hrtimer_init(&cdata->gen_irq_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	cdata->gen_irq_timer.function = hr_dispath_irq_func;
+
 	wake_lock_init(&microp_i2c_wakelock, WAKE_LOCK_SUSPEND,
 			 "microp_i2c_present");
 
@@ -2021,6 +2083,10 @@ static int microp_i2c_probe(struct i2c_client *client,
 				__func__);
 		goto err_register_bma150;
 	}
+	
+	mutex_init(&gsensor_RW_mutex);
+	mutex_init(&gsensor_set_mode_mutex);
+
 #ifdef DEBUG_BMA150
 	debugfs_create_file("gsensor_log", 0444, NULL, NULL, &gsensor_log_fops);
 #endif
@@ -2186,8 +2252,38 @@ static struct i2c_driver microp_i2c_driver = {
 	.remove = __devexit_p(microp_i2c_remove),
 };
 
+static void microp_irq_ack(unsigned int irq)
+{
+	;
+}
+
+static void microp_irq_mask(unsigned int irq)
+{
+	;
+}
+
+static void microp_irq_unmask(unsigned int irq)
+{
+	;
+}
+
+static struct irq_chip microp_irq_chip = {
+	.name = "microp",
+	.disable = microp_irq_mask,
+	.ack = microp_irq_ack,
+	.mask = microp_irq_mask,
+	.unmask = microp_irq_unmask,
+};
+
 static int __init microp_i2c_init(void)
 {
+	int n, MICROP_IRQ_END = FIRST_MICROP_IRQ + NR_MICROP_IRQS;
+	for (n = FIRST_MICROP_IRQ; n < MICROP_IRQ_END; n++) {
+		set_irq_chip(n, &microp_irq_chip);
+		set_irq_handler(n, handle_level_irq);
+		set_irq_flags(n, IRQF_VALID);
+	}
+
 	return i2c_add_driver(&microp_i2c_driver);
 }
 

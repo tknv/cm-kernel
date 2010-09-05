@@ -48,6 +48,7 @@
 #define MICROP_I2C_WCMD_READ_ADC_VALUE_REQ		0x60
 #define MICROP_I2C_RCMD_ADC_VALUE			0x62
 #define MICROP_I2C_WCMD_REMOTEKEY_TABLE			0x63
+#define MICROP_I2C_WCMD_LCM_BURST_EN			0x6B
 #define MICROP_I2C_WCMD_LCM_REGISTER			0x70
 #define MICROP_I2C_WCMD_GSENSOR_REG			0x73
 #define MICROP_I2C_WCMD_GSENSOR_REG_DATA_REQ		0x74
@@ -78,7 +79,7 @@
 
 /* Desire - verified in 2.6.29 */
 #define IRQ_OJ						(1<<12)
-#define IRQ_GSENSORi					(1<<10)
+#define IRQ_GSENSOR					(1<<10)
 #define IRQ_LSENSOR					(1<<9)
 #define IRQ_REMOTEKEY					(1<<7)
 #define IRQ_HEADSETIN					(1<<2)
