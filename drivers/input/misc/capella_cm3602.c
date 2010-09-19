@@ -38,19 +38,6 @@ static int misc_opened;
 static int capella_cm3602_report(struct capella_cm3602_data *data)
 {
 	int val = gpio_get_value(data->pdata->p_out);
-#if defined(CONFIG_MACH_BRAVO)
-	int value1, value2;
-	int retry_limit = 10;
-	int irq = gpio_to_irq(data->pdata->p_out);
-
-	do {
-		value1 = gpio_get_value(data->pdata->p_out);
-		set_irq_type(irq, value1 ?
-				IRQF_TRIGGER_LOW : IRQF_TRIGGER_HIGH);
-		value2 = gpio_get_value(data->pdata->p_out);
-	} while (value1 != value2 && retry_limit-- > 0);
-#endif
-
 	if (val < 0) {
 		pr_err("%s: gpio_get_value error %d\n", __func__, val);
 		return val;
@@ -73,38 +60,35 @@ static irqreturn_t capella_cm3602_irq_handler(int irq, void *data)
 
 static int capella_cm3602_enable(struct capella_cm3602_data *data)
 {
-	int rc;
 	D("%s\n", __func__);
 	if (data->enabled) {
 		D("%s: already enabled\n", __func__);
-		return 0;
-	}
+	} else {
 #if defined(CONFIG_MACH_BRAVO)
-	data->pdata->power(PS_PWR_ON, 1);
+		data->pdata->power(PS_PWR_ON, 1);
 #else
-	data->pdata->power(1);
+		data->pdata->power(1);
 #endif
-	data->enabled = !rc;
-	if (!rc)
+		data->enabled = 1;
 		capella_cm3602_report(data);
-	return rc;
+	}
+	return 0;
 }
 
 static int capella_cm3602_disable(struct capella_cm3602_data *data)
 {
-	int rc = -EIO;
 	D("%s\n", __func__);
-	if (!data->enabled) {
-		D("%s: already disabled\n", __func__);
-		return 0;
-	}
+	if (data->enabled) {
 #if defined(CONFIG_MACH_BRAVO)
-	data->pdata->power(PS_PWR_ON ,0);
+		data->pdata->power(PS_PWR_ON ,0);
 #else
-	data->pdata->power(0);
+		data->pdata->power(0);
 #endif
-	data->enabled = 0;
-	return rc;
+		data->enabled = 0;
+	} else {
+		D("%s: already disabled\n", __func__);
+	}
+	return 0;
 }
 
 static int capella_cm3602_setup(struct capella_cm3602_data *ip)
