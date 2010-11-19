@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
  * superblock private data
  */
 
+#include <linux/jiffies.h>
 #include "aufs.h"
 
 /*
@@ -28,18 +29,24 @@
 void au_si_free(struct kobject *kobj)
 {
 	struct au_sbinfo *sbinfo;
-	struct super_block *sb;
+	char *locked __maybe_unused; /* debug only */
 
 	sbinfo = container_of(kobj, struct au_sbinfo, si_kobj);
 	AuDebugOn(!list_empty(&sbinfo->si_plink.head));
+	AuDebugOn(atomic_read(&sbinfo->si_nowait.nw_len));
 
-	sb = sbinfo->si_sb;
-	si_write_lock(sb);
-	au_xino_clr(sb);
+	au_rw_write_lock(&sbinfo->si_rwsem);
 	au_br_free(sbinfo);
+	au_rw_write_unlock(&sbinfo->si_rwsem);
+
+	AuDebugOn(radix_tree_gang_lookup
+		  (&sbinfo->au_si_pid.tree, (void **)&locked,
+		   /*first_index*/PID_MAX_DEFAULT - 1,
+		   /*max_items*/sizeof(locked)/sizeof(*locked)));
+
 	kfree(sbinfo->si_branch);
+	kfree(sbinfo->au_si_pid.bitmap);
 	mutex_destroy(&sbinfo->si_xib_mtx);
-	si_write_unlock(sb);
 	AuRwDestroy(&sbinfo->si_rwsem);
 
 	kfree(sbinfo);
@@ -49,63 +56,72 @@ int au_si_alloc(struct super_block *sb)
 {
 	int err;
 	struct au_sbinfo *sbinfo;
+	static struct lock_class_key aufs_si;
 
 	err = -ENOMEM;
-	sbinfo = kmalloc(sizeof(*sbinfo), GFP_NOFS);
+	sbinfo = kzalloc(sizeof(*sbinfo), GFP_NOFS);
 	if (unlikely(!sbinfo))
 		goto out;
+
+	BUILD_BUG_ON(sizeof(unsigned long) !=
+		     sizeof(*sbinfo->au_si_pid.bitmap));
+	sbinfo->au_si_pid.bitmap = kcalloc(BITS_TO_LONGS(PID_MAX_DEFAULT),
+					sizeof(*sbinfo->au_si_pid.bitmap),
+					GFP_NOFS);
+	if (unlikely(!sbinfo->au_si_pid.bitmap))
+		goto out_sbinfo;
 
 	/* will be reallocated separately */
 	sbinfo->si_branch = kzalloc(sizeof(*sbinfo->si_branch), GFP_NOFS);
 	if (unlikely(!sbinfo->si_branch))
-		goto out_sbinfo;
+		goto out_pidmap;
 
-	memset(&sbinfo->si_kobj, 0, sizeof(sbinfo->si_kobj));
 	err = sysaufs_si_init(sbinfo);
 	if (unlikely(err))
 		goto out_br;
 
 	au_nwt_init(&sbinfo->si_nowait);
 	au_rw_init_wlock(&sbinfo->si_rwsem);
-	sbinfo->si_generation = 0;
-	sbinfo->au_si_status = 0;
+	au_rw_class(&sbinfo->si_rwsem, &aufs_si);
+	spin_lock_init(&sbinfo->au_si_pid.tree_lock);
+	INIT_RADIX_TREE(&sbinfo->au_si_pid.tree, GFP_ATOMIC | __GFP_NOFAIL);
+
 	sbinfo->si_bend = -1;
-	sbinfo->si_last_br_id = 0;
 
 	sbinfo->si_wbr_copyup = AuWbrCopyup_Def;
 	sbinfo->si_wbr_create = AuWbrCreate_Def;
-	sbinfo->si_wbr_copyup_ops = au_wbr_copyup_ops + AuWbrCopyup_Def;
-	sbinfo->si_wbr_create_ops = au_wbr_create_ops + AuWbrCreate_Def;
+	sbinfo->si_wbr_copyup_ops = au_wbr_copyup_ops + sbinfo->si_wbr_copyup;
+	sbinfo->si_wbr_create_ops = au_wbr_create_ops + sbinfo->si_wbr_create;
 
-	sbinfo->si_mntflags = AuOpt_Def;
+	sbinfo->si_mntflags = au_opts_plink(AuOpt_Def);
 
-	sbinfo->si_xread = NULL;
-	sbinfo->si_xwrite = NULL;
-	sbinfo->si_xib = NULL;
 	mutex_init(&sbinfo->si_xib_mtx);
-	sbinfo->si_xib_buf = NULL;
 	sbinfo->si_xino_brid = -1;
 	/* leave si_xib_last_pindex and si_xib_next_bit */
 
-	sbinfo->si_rdcache = AUFS_RDCACHE_DEF * HZ;
+	sbinfo->si_rdcache = msecs_to_jiffies(AUFS_RDCACHE_DEF * MSEC_PER_SEC);
 	sbinfo->si_rdblk = AUFS_RDBLK_DEF;
 	sbinfo->si_rdhash = AUFS_RDHASH_DEF;
 	sbinfo->si_dirwh = AUFS_DIRWH_DEF;
 
 	au_spl_init(&sbinfo->si_plink);
 	init_waitqueue_head(&sbinfo->si_plink_wq);
+	spin_lock_init(&sbinfo->si_plink_maint_lock);
 
 	/* leave other members for sysaufs and si_mnt. */
 	sbinfo->si_sb = sb;
 	sb->s_fs_info = sbinfo;
+	si_pid_set(sb);
 	au_debug_sbinfo_init(sbinfo);
 	return 0; /* success */
 
- out_br:
+out_br:
 	kfree(sbinfo->si_branch);
- out_sbinfo:
+out_pidmap:
+	kfree(sbinfo->au_si_pid.bitmap);
+out_sbinfo:
 	kfree(sbinfo);
- out:
+out:
 	return err;
 }
 
@@ -113,6 +129,8 @@ int au_sbr_realloc(struct au_sbinfo *sbinfo, int nbr)
 {
 	int err, sz;
 	struct au_branch **brp;
+
+	AuRwMustWriteLock(&sbinfo->si_rwsem);
 
 	err = -ENOMEM;
 	sz = sizeof(*brp) * (sbinfo->si_bend + 1);
@@ -133,6 +151,8 @@ unsigned int au_sigen_inc(struct super_block *sb)
 {
 	unsigned int gen;
 
+	SiMustWriteLock(sb);
+
 	gen = ++au_sbi(sb)->si_generation;
 	au_update_digen(sb->s_root);
 	au_update_iigen(sb->s_root->d_inode);
@@ -146,6 +166,8 @@ aufs_bindex_t au_new_br_id(struct super_block *sb)
 	int i;
 	struct au_sbinfo *sbinfo;
 
+	SiMustWriteLock(sb);
+
 	sbinfo = au_sbi(sb);
 	for (i = 0; i <= AUFS_BRANCH_MAX; i++) {
 		br_id = ++sbinfo->si_last_br_id;
@@ -158,14 +180,52 @@ aufs_bindex_t au_new_br_id(struct super_block *sb)
 
 /* ---------------------------------------------------------------------- */
 
-/* dentry and super_block lock. call at entry point */
-void aufs_read_lock(struct dentry *dentry, int flags)
+/* it is ok that new 'nwt' tasks are appended while we are sleeping */
+int si_read_lock(struct super_block *sb, int flags)
 {
-	si_read_lock(dentry->d_sb, flags);
-	if (au_ftest_lock(flags, DW))
-		di_write_lock_child(dentry);
-	else
-		di_read_lock_child(dentry, flags);
+	int err;
+
+	err = 0;
+	if (au_ftest_lock(flags, FLUSH))
+		au_nwt_flush(&au_sbi(sb)->si_nowait);
+
+	si_noflush_read_lock(sb);
+	err = au_plink_maint(sb, flags);
+	if (unlikely(err))
+		si_read_unlock(sb);
+
+	return err;
+}
+
+int si_write_lock(struct super_block *sb, int flags)
+{
+	int err;
+
+	if (au_ftest_lock(flags, FLUSH))
+		au_nwt_flush(&au_sbi(sb)->si_nowait);
+
+	si_noflush_write_lock(sb);
+	err = au_plink_maint(sb, flags);
+	if (unlikely(err))
+		si_write_unlock(sb);
+
+	return err;
+}
+
+/* dentry and super_block lock. call at entry point */
+int aufs_read_lock(struct dentry *dentry, int flags)
+{
+	int err;
+
+	err = si_read_lock(dentry->d_sb, flags);
+	if (!err) {
+		if (au_ftest_lock(flags, DW))
+			di_write_lock_child(dentry);
+		else
+			di_read_lock_child(dentry, flags);
+	}
+
+	return err;
 }
 
 void aufs_read_unlock(struct dentry *dentry, int flags)
@@ -179,7 +239,7 @@ void aufs_read_unlock(struct dentry *dentry, int flags)
 
 void aufs_write_lock(struct dentry *dentry)
 {
-	si_write_lock(dentry->d_sb);
+	si_write_lock(dentry->d_sb, AuLock_FLUSH | AuLock_NOPLMW);
 	di_write_lock_child(dentry);
 }
 
@@ -189,14 +249,63 @@ void aufs_write_unlock(struct dentry *dentry)
 	si_write_unlock(dentry->d_sb);
 }
 
-void aufs_read_and_write_lock2(struct dentry *d1, struct dentry *d2, int flags)
+int aufs_read_and_write_lock2(struct dentry *d1, struct dentry *d2, int flags)
 {
-	si_read_lock(d1->d_sb, flags);
-	di_write_lock2_child(d1, d2, au_ftest_lock(flags, DIR));
+	int err;
+
+	err = si_read_lock(d1->d_sb, flags);
+	if (!err)
+		di_write_lock2_child(d1, d2, au_ftest_lock(flags, DIR));
+	return err;
 }
 
 void aufs_read_and_write_unlock2(struct dentry *d1, struct dentry *d2)
 {
 	di_write_unlock2(d1, d2);
 	si_read_unlock(d1->d_sb);
+}
+
+/* ---------------------------------------------------------------------- */
+
+int si_pid_test_slow(struct super_block *sb)
+{
+	void *p;
+
+	rcu_read_lock();
+	p = radix_tree_lookup(&au_sbi(sb)->au_si_pid.tree, current->pid);
+	rcu_read_unlock();
+
+	return (long)p;
+}
+
+void si_pid_set_slow(struct super_block *sb)
+{
+	int err;
+	struct au_sbinfo *sbinfo;
+
+	AuDebugOn(si_pid_test_slow(sb));
+
+	sbinfo = au_sbi(sb);
+	err = radix_tree_preload(GFP_NOFS | __GFP_NOFAIL);
+	AuDebugOn(err);
+	spin_lock(&sbinfo->au_si_pid.tree_lock);
+	err = radix_tree_insert(&sbinfo->au_si_pid.tree, current->pid,
+				(void *)1);
+	spin_unlock(&sbinfo->au_si_pid.tree_lock);
+	AuDebugOn(err);
+	radix_tree_preload_end();
+}
+
+void si_pid_clr_slow(struct super_block *sb)
+{
+	void *p;
+	struct au_sbinfo *sbinfo;
+
+	AuDebugOn(!si_pid_test_slow(sb));
+
+	sbinfo = au_sbi(sb);
+	spin_lock(&sbinfo->au_si_pid.tree_lock);
+	p = radix_tree_delete(&sbinfo->au_si_pid.tree, current->pid);
+	spin_unlock(&sbinfo->au_si_pid.tree_lock);
+	AuDebugOn(1 != (long)p);
 }

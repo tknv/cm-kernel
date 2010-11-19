@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -80,7 +80,7 @@ static int dbgaufs_xi_open(struct file *xf, struct file *file, int do_fcnt)
 		err = 0;
 	}
 
- out:
+out:
 	return err;
 
 }
@@ -111,6 +111,7 @@ static int dbgaufs_xib_open(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations dbgaufs_xib_fop = {
+	.owner		= THIS_MODULE,
 	.open		= dbgaufs_xib_open,
 	.release	= dbgaufs_xi_release,
 	.read		= dbgaufs_xi_read
@@ -150,11 +151,12 @@ static int dbgaufs_xino_open(struct inode *inode, struct file *file)
 		err = -ENOENT;
 	si_read_unlock(sb);
 
- out:
+out:
 	return err;
 }
 
 static const struct file_operations dbgaufs_xino_fop = {
+	.owner		= THIS_MODULE,
 	.open		= dbgaufs_xino_open,
 	.release	= dbgaufs_xi_release,
 	.read		= dbgaufs_xi_read
@@ -226,6 +228,7 @@ static int dbgaufs_xigen_open(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations dbgaufs_xigen_fop = {
+	.owner		= THIS_MODULE,
 	.open		= dbgaufs_xigen_open,
 	.release	= dbgaufs_xi_release,
 	.read		= dbgaufs_xi_read
@@ -234,6 +237,12 @@ static const struct file_operations dbgaufs_xigen_fop = {
 static int dbgaufs_xigen_init(struct au_sbinfo *sbinfo)
 {
 	int err;
+
+	/*
+	 * This function is a dynamic '__init' fucntion actually,
+	 * so the tiny check for si_rwsem is unnecessary.
+	 */
+	/* AuRwMustWriteLock(&sbinfo->si_rwsem); */
 
 	err = -EIO;
 	sbinfo->si_dbgaufs_xigen = debugfs_create_file
@@ -255,6 +264,12 @@ static int dbgaufs_xigen_init(struct au_sbinfo *sbinfo)
 
 void dbgaufs_si_fin(struct au_sbinfo *sbinfo)
 {
+	/*
+	 * This function is a dynamic '__init' fucntion actually,
+	 * so the tiny check for si_rwsem is unnecessary.
+	 */
+	/* AuRwMustWriteLock(&sbinfo->si_rwsem); */
+
 	debugfs_remove_recursive(sbinfo->si_dbgaufs);
 	sbinfo->si_dbgaufs = NULL;
 	kobject_put(&sbinfo->si_kobj);
@@ -264,6 +279,12 @@ int dbgaufs_si_init(struct au_sbinfo *sbinfo)
 {
 	int err;
 	char name[SysaufsSiNameLen];
+
+	/*
+	 * This function is a dynamic '__init' fucntion actually,
+	 * so the tiny check for si_rwsem is unnecessary.
+	 */
+	/* AuRwMustWriteLock(&sbinfo->si_rwsem); */
 
 	err = -ENOENT;
 	if (!dbgaufs) {
@@ -288,9 +309,9 @@ int dbgaufs_si_init(struct au_sbinfo *sbinfo)
 	if (!err)
 		goto out; /* success */
 
- out_dir:
+out_dir:
 	dbgaufs_si_fin(sbinfo);
- out:
+out:
 	return err;
 }
 

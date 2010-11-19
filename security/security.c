@@ -439,6 +439,7 @@ int security_path_chmod(struct dentry *dentry, struct vfsmount *mnt,
 		return 0;
 	return security_ops->path_chmod(dentry, mnt, mode);
 }
+EXPORT_SYMBOL(security_path_chmod);
 
 int security_path_chown(struct path *path, uid_t uid, gid_t gid)
 {
@@ -446,6 +447,7 @@ int security_path_chown(struct path *path, uid_t uid, gid_t gid)
 		return 0;
 	return security_ops->path_chown(path, uid, gid);
 }
+EXPORT_SYMBOL(security_path_chown);
 
 int security_path_chroot(struct path *path)
 {

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -82,7 +82,7 @@ int au_wr_dir_need_wh(struct dentry *dentry, int isdir, aufs_bindex_t *bcpup)
 	AuDbg("need_wh %d\n", need_wh);
 	err = need_wh;
 
- out:
+out:
 	return err;
 }
 
@@ -144,7 +144,7 @@ int au_may_del(struct dentry *dentry, aufs_bindex_t bindex,
 		err = 0;
 	dput(h_latest);
 
- out:
+out:
 	return err;
 }
 
@@ -201,9 +201,9 @@ lock_hdir_create_wh(struct dentry *dentry, int isdir, aufs_bindex_t *rbcpup,
 	/* returns with the parent is locked and wh_dentry is dget-ed */
 	goto out; /* success */
 
- out_unpin:
+out_unpin:
 	au_unpin(pin);
- out:
+out:
 	return wh_dentry;
 }
 
@@ -224,13 +224,14 @@ static int renwh_and_rmdir(struct dentry *dentry, aufs_bindex_t bindex,
 	struct super_block *sb;
 
 	sb = dentry->d_sb;
+	SiMustAnyLock(sb);
 	h_dentry = au_h_dptr(dentry, bindex);
 	err = au_whtmp_ren(h_dentry, au_sbr(sb, bindex));
 	if (unlikely(err))
 		goto out;
 
 	/* stop monitoring */
-	au_hin_free(au_hi(dentry->d_inode, bindex));
+	au_hn_free(au_hi(dentry->d_inode, bindex));
 
 	if (!au_test_fs_remote(h_dentry->d_sb)) {
 		dirwh = au_sbi(sb)->si_dirwh;
@@ -249,7 +250,7 @@ static int renwh_and_rmdir(struct dentry *dentry, aufs_bindex_t bindex,
 		err = 0;
 	}
 
- out:
+out:
 	AuTraceErr(err);
 	return err;
 }
@@ -367,11 +368,11 @@ int aufs_unlink(struct inode *dir, struct dentry *dentry)
 			err = rerr;
 	}
 
- out_unlock:
+out_unlock:
 	au_unpin(&pin);
 	dput(wh_dentry);
 	dput(h_path.dentry);
- out:
+out:
 	di_write_unlock(parent);
 	aufs_read_unlock(dentry, AuLock_DW);
 	return err;
@@ -385,8 +386,7 @@ int aufs_rmdir(struct inode *dir, struct dentry *dentry)
 	struct au_pin pin;
 	struct inode *inode;
 	struct dentry *parent, *wh_dentry, *h_dentry;
-	struct au_whtmp_rmdir_args *args;
-	struct au_nhash *whlist;
+	struct au_whtmp_rmdir *args;
 
 	IMustLock(dir);
 	inode = dentry->d_inode;
@@ -395,20 +395,15 @@ int aufs_rmdir(struct inode *dir, struct dentry *dentry)
 		goto out;
 	IMustLock(inode);
 
-	whlist = au_nhash_new(GFP_NOFS);
-	err = PTR_ERR(whlist);
-	if (IS_ERR(whlist))
-		goto out;
-
-	err = -ENOMEM;
-	args = kmalloc(sizeof(*args), GFP_NOFS);
-	if (unlikely(!args))
-		goto out_whlist;
-
 	aufs_read_lock(dentry, AuLock_DW | AuLock_FLUSH);
+	err = -ENOMEM;
+	args = au_whtmp_rmdir_alloc(dir->i_sb, GFP_NOFS);
+	if (unlikely(!args))
+		goto out_unlock;
+
 	parent = dentry->d_parent; /* dir inode is locked */
 	di_write_lock_parent(parent);
-	err = au_test_empty(dentry, whlist);
+	err = au_test_empty(dentry, &args->whlist);
 	if (unlikely(err))
 		goto out_args;
 
@@ -424,14 +419,14 @@ int aufs_rmdir(struct inode *dir, struct dentry *dentry)
 	dget(h_dentry);
 	rmdir_later = 0;
 	if (bindex == bstart) {
-		err = renwh_and_rmdir(dentry, bstart, whlist, dir);
+		err = renwh_and_rmdir(dentry, bstart, &args->whlist, dir);
 		if (err > 0) {
 			rmdir_later = err;
 			err = 0;
 		}
 	} else {
 		/* stop monitoring */
-		au_hin_free(au_hi(inode, bstart));
+		au_hn_free(au_hi(inode, bstart));
 
 		/* dir inode is locked */
 		IMustLock(wh_dentry->d_parent->d_inode);
@@ -444,12 +439,11 @@ int aufs_rmdir(struct inode *dir, struct dentry *dentry)
 		epilog(dir, dentry, bindex);
 
 		if (rmdir_later) {
-			au_whtmp_kick_rmdir(dir, bstart, h_dentry, whlist,
-					    args);
+			au_whtmp_kick_rmdir(dir, bstart, h_dentry, args);
 			args = NULL;
 		}
 
-		goto out_unlock; /* success */
+		goto out_unpin; /* success */
 	}
 
 	/* revert */
@@ -462,17 +456,17 @@ int aufs_rmdir(struct inode *dir, struct dentry *dentry)
 			err = rerr;
 	}
 
- out_unlock:
+out_unpin:
 	au_unpin(&pin);
 	dput(wh_dentry);
 	dput(h_dentry);
- out_args:
+out_args:
 	di_write_unlock(parent);
+	if (args)
+		au_whtmp_rmdir_free(args);
+out_unlock:
 	aufs_read_unlock(dentry, AuLock_DW);
-	kfree(args);
- out_whlist:
-	au_nhash_del(whlist);
- out:
+out:
 	AuTraceErr(err);
 	return err;
 }

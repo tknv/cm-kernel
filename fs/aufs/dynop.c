@@ -140,7 +140,7 @@ void au_dy_put(struct au_dykey *key)
 
 #ifdef CONFIG_AUFS_DEBUG
 #define DyDbgDeclare(cnt)	unsigned int cnt = 0
-#define DyDbgInc(cnt)		cnt++
+#define DyDbgInc(cnt)		do { cnt++; } while (0)
 #else
 #define DyDbgDeclare(cnt)	do {} while (0)
 #define DyDbgInc(cnt)		do {} while (0)
@@ -162,48 +162,41 @@ void au_dy_put(struct au_dykey *key)
 	dst.func = src.func;			\
 } while (0)
 
-#define DySetFop(func) \
-	DySet(func, dyfop->df_op, aufs_file_fop, h_fop, h_sb)
-#define DySetFopForce(func) \
-	DySetForce(func, dyfop->df_op, aufs_file_fop)
+#define DySetAop(func) \
+	DySet(func, dyaop->da_op, aufs_aop, h_aop, h_sb)
+#define DySetAopForce(func) \
+	DySetForce(func, dyaop->da_op, aufs_aop)
 
-static void dy_fop(struct au_dykey *key, const void *h_op,
+static void dy_aop(struct au_dykey *key, const void *h_op,
 		   struct super_block *h_sb __maybe_unused)
 {
-	struct au_dyfop *dyfop = (void *)key;
-	const struct file_operations *h_fop = h_op;
+	struct au_dyaop *dyaop = (void *)key;
+	const struct address_space_operations *h_aop = h_op;
 	DyDbgDeclare(cnt);
 
 	AuDbg("%s\n", au_sbtype(h_sb));
 
-	DySetFopForce(owner);		/* force */
-	DySetFop(llseek);
-	DySetFop(read);
-	DySetFopForce(write);		/* force */
-	DySetFop(aio_read);
-	DySetFopForce(aio_write);	/* force */
-	DySetFop(readdir);
-	DySetFop(poll);
-	DySetFop(ioctl);
-	DySetFopForce(unlocked_ioctl);	/* force */
-	DySetFop(compat_ioctl);
-	DySetFop(mmap);
-	DySetFopForce(open);		/* force */
-	DySetFop(flush);
-	DySetFopForce(release);		/* force */
-	DySetFopForce(fsync);		/* force */
-	DySetFop(aio_fsync);
-	DySetFop(fasync);
-	DySetFop(lock);
-	DySetFop(sendpage);
-	DySetFop(get_unmapped_area);
-	DySetFop(check_flags);
-	DySetFop(flock);
-	DySetFopForce(splice_write);	/* force */
-	DySetFop(splice_read);
-	DySetFop(setlease);
+	DySetAop(writepage);
+	DySetAopForce(readpage);	/* force */
+	DySetAop(sync_page);
+	DySetAop(writepages);
+	DySetAop(set_page_dirty);
+	DySetAop(readpages);
+	DySetAop(write_begin);
+	DySetAop(write_end);
+	DySetAop(bmap);
+	DySetAop(invalidatepage);
+	DySetAop(releasepage);
+	/* these two will be changed according to an aufs mount option */
+	DySetAop(direct_IO);
+	DySetAop(get_xip_mem);
+	DySetAop(migratepage);
+	DySetAop(launder_page);
+	DySetAop(is_partially_uptodate);
+	DySetAop(error_remove_page);
 
-	DyDbgSize(cnt, *h_fop);
+	DyDbgSize(cnt, *h_aop);
+	dyaop->da_get_xip_mem = h_aop->get_xip_mem;
 }
 
 #define DySetVmop(func) \
@@ -245,20 +238,22 @@ static struct au_dykey *dy_get(struct au_dynop *op, struct au_branch *br)
 {
 	struct au_dykey *key, *old;
 	struct au_splhead *spl;
-	static const struct {
+	struct op {
 		unsigned int sz;
-		void (*set_op)(struct au_dykey *key, const void *h_op,
-			       struct super_block *h_sb __maybe_unused);
-	} a[] = {
-		[AuDy_FOP] = {
-			.sz	= sizeof(struct au_dyfop),
-			.set_op	= dy_fop
+		void (*set)(struct au_dykey *key, const void *h_op,
+			    struct super_block *h_sb __maybe_unused);
+	};
+	static const struct op a[] = {
+		[AuDy_AOP] = {
+			.sz	= sizeof(struct au_dyaop),
+			.set	= dy_aop
 		},
 		[AuDy_VMOP] = {
 			.sz	= sizeof(struct au_dyvmop),
-			.set_op	= dy_vmop
+			.set	= dy_vmop
 		}
-	}, *p;
+	};
+	const struct op *p;
 
 	spl = dynop + op->dy_type;
 	key = dy_gfind_get(spl, op->dy_hop);
@@ -274,7 +269,7 @@ static struct au_dykey *dy_get(struct au_dynop *op, struct au_branch *br)
 
 	key->dk_op.dy_hop = op->dy_hop;
 	kref_init(&key->dk_kref);
-	p->set_op(key, op->dy_hop, br->br_mnt->mnt_sb);
+	p->set(key, op->dy_hop, br->br_mnt->mnt_sb);
 	old = dy_gadd(spl, key);
 	if (old) {
 		kfree(key);
@@ -291,39 +286,105 @@ out:
 }
 
 /* ---------------------------------------------------------------------- */
-
-static struct au_dyfop *dy_fget(struct au_branch *br,
-				const struct file_operations *h_fop)
+/*
+ * Aufs prohibits O_DIRECT by defaut even if the branch supports it.
+ * This behaviour is neccessary to return an error from open(O_DIRECT) instead
+ * of the succeeding I/O. The dio mount option enables O_DIRECT and makes
+ * open(O_DIRECT) always succeed, but the succeeding I/O may return an error.
+ * See the aufs manual in detail.
+ *
+ * To keep this behaviour, aufs has to set NULL to ->get_xip_mem too, and the
+ * performance of fadvise() and madvise() may be affected.
+ */
+static void dy_adx(struct au_dyaop *dyaop, int do_dx)
 {
-	struct au_dynop op = {
-		.dy_type	= AuDy_FOP,
-		/* .dy_hfop	= h_inode->i_fop */
-	};
-
-	op.dy_hfop = h_fop;
-	return (void *)dy_get(&op, br);
+	if (!do_dx) {
+		dyaop->da_op.direct_IO = NULL;
+		dyaop->da_op.get_xip_mem = NULL;
+	} else {
+		dyaop->da_op.direct_IO = aufs_aop.direct_IO;
+		dyaop->da_op.get_xip_mem = aufs_aop.get_xip_mem;
+		if (!dyaop->da_get_xip_mem)
+			dyaop->da_op.get_xip_mem = NULL;
+	}
 }
 
-int au_dy_ifop(struct inode *inode, aufs_bindex_t bindex, struct inode *h_inode)
+static struct au_dyaop *dy_aget(struct au_branch *br,
+				const struct address_space_operations *h_aop,
+				int do_dx)
 {
-	int err;
+	struct au_dyaop *dyaop;
+	struct au_dynop op;
+
+	op.dy_type = AuDy_AOP;
+	op.dy_haop = h_aop;
+	dyaop = (void *)dy_get(&op, br);
+	if (IS_ERR(dyaop))
+		goto out;
+	dy_adx(dyaop, do_dx);
+
+out:
+	return dyaop;
+}
+
+int au_dy_iaop(struct inode *inode, aufs_bindex_t bindex,
+		struct inode *h_inode)
+{
+	int err, do_dx;
+	struct super_block *sb;
 	struct au_branch *br;
-	struct au_dyfop *dyfop;
+	struct au_dyaop *dyaop;
 
 	AuDebugOn(!S_ISREG(h_inode->i_mode));
 	IiMustWriteLock(inode);
 
-	br = au_sbr(inode->i_sb, bindex);
-	dyfop = dy_fget(br, h_inode->i_fop);
-	err = PTR_ERR(dyfop);
-	if (IS_ERR(dyfop))
+	sb = inode->i_sb;
+	br = au_sbr(sb, bindex);
+	do_dx = !!au_opt_test(au_mntflags(sb), DIO);
+	dyaop = dy_aget(br, h_inode->i_mapping->a_ops, do_dx);
+	err = PTR_ERR(dyaop);
+	if (IS_ERR(dyaop))
+		/* unnecessary to call dy_fput() */
 		goto out;
 
 	err = 0;
-	inode->i_fop = &dyfop->df_op;
+	inode->i_mapping->a_ops = &dyaop->da_op;
 
 out:
 	return err;
+}
+
+/*
+ * Is it safe to replace a_ops during the inode/file is in operation?
+ * Yes, I hope so.
+ */
+int au_dy_irefresh(struct inode *inode)
+{
+	int err;
+	aufs_bindex_t bstart;
+	struct inode *h_inode;
+
+	err = 0;
+	if (S_ISREG(inode->i_mode)) {
+		bstart = au_ibstart(inode);
+		h_inode = au_h_iptr(inode, bstart);
+		err = au_dy_iaop(inode, bstart, h_inode);
+	}
+	return err;
+}
+
+void au_dy_arefresh(int do_dx)
+{
+	struct au_splhead *spl;
+	struct list_head *head;
+	struct au_dykey *key;
+
+	spl = dynop + AuDy_AOP;
+	head = &spl->head;
+	spin_lock(&spl->spin);
+	list_for_each_entry(key, head, dk_list)
+		dy_adx((void *)key, do_dx);
+	spin_unlock(&spl->spin);
 }
 
 const struct vm_operations_struct *
@@ -348,7 +409,7 @@ void __init au_dy_init(void)
 	int i;
 
 	/* make sure that 'struct au_dykey *' can be any type */
-	BUILD_BUG_ON(offsetof(struct au_dyfop, df_key));
+	BUILD_BUG_ON(offsetof(struct au_dyaop, da_key));
 	BUILD_BUG_ON(offsetof(struct au_dyvmop, dv_key));
 
 	for (i = 0; i < AuDyLast; i++)

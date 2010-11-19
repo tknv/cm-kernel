@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -91,41 +91,28 @@ static int au_test_anon(struct dentry *dentry)
 /* ---------------------------------------------------------------------- */
 /* inode generation external table */
 
-int au_xigen_inc(struct inode *inode)
+void au_xigen_inc(struct inode *inode)
 {
-	int err;
 	loff_t pos;
 	ssize_t sz;
 	__u32 igen;
 	struct super_block *sb;
 	struct au_sbinfo *sbinfo;
 
-	err = 0;
 	sb = inode->i_sb;
-	sbinfo = au_sbi(sb);
-	/*
-	 * temporary workaround for escaping from SiMustAnyLock() in
-	 * au_mntflags(), since this function is called from au_iinfo_fin().
-	 */
-	if (unlikely(!au_opt_test(sbinfo->si_mntflags, XINO)))
-		goto out;
+	AuDebugOn(!au_opt_test(au_mntflags(sb), XINO));
 
+	sbinfo = au_sbi(sb);
 	pos = inode->i_ino;
 	pos *= sizeof(igen);
 	igen = inode->i_generation + 1;
 	sz = xino_fwrite(sbinfo->si_xwrite, sbinfo->si_xigen, &igen,
 			 sizeof(igen), &pos);
 	if (sz == sizeof(igen))
-		goto out; /* success */
+		return; /* success */
 
-	err = sz;
-	if (unlikely(sz >= 0)) {
-		err = -EIO;
+	if (unlikely(sz >= 0))
 		AuIOErr("xigen error (%zd)\n", sz);
-	}
-
- out:
-	return err;
 }
 
 int au_xigen_new(struct inode *inode)
@@ -142,6 +129,7 @@ int au_xigen_new(struct inode *inode)
 	if (inode->i_ino == AUFS_ROOT_INO)
 		goto out;
 	sb = inode->i_sb;
+	SiMustAnyLock(sb);
 	if (unlikely(!au_opt_test(au_mntflags(sb), XINO)))
 		goto out;
 
@@ -175,7 +163,7 @@ int au_xigen_new(struct inode *inode)
 		AuIOErr("xigen error (%zd)\n", sz);
 	}
 
- out:
+out:
 	return err;
 }
 
@@ -184,6 +172,8 @@ int au_xigen_set(struct super_block *sb, struct file *base)
 	int err;
 	struct au_sbinfo *sbinfo;
 	struct file *file;
+
+	SiMustWriteLock(sb);
 
 	sbinfo = au_sbi(sb);
 	file = au_xino_create2(base, sbinfo->si_xigen);
@@ -195,13 +185,15 @@ int au_xigen_set(struct super_block *sb, struct file *base)
 		fput(sbinfo->si_xigen);
 	sbinfo->si_xigen = file;
 
- out:
+out:
 	return err;
 }
 
 void au_xigen_clr(struct super_block *sb)
 {
 	struct au_sbinfo *sbinfo;
+
+	SiMustWriteLock(sb);
 
 	sbinfo = au_sbi(sb);
 	if (sbinfo->si_xigen) {
@@ -249,9 +241,9 @@ static struct dentry *decode_by_ino(struct super_block *sb, ino_t ino,
 		dentry = ERR_PTR(-ESTALE);
 	}
 
- out_iput:
+out_iput:
 	iput(inode);
- out:
+out:
 	return dentry;
 }
 
@@ -318,7 +310,7 @@ static aufs_bindex_t si_nfsd_read_lock(struct super_block *sb,
 		si_read_unlock(sb);
 	bindex = -1;
 
- out:
+out:
 	return bindex;
 }
 
@@ -357,14 +349,13 @@ static struct dentry *au_lkup_by_ino(struct path *path, ino_t ino,
 	parent = path->dentry;
 	if (nsi_lock)
 		si_read_unlock(parent->d_sb);
-	path_get(path);
-	file = dentry_open(parent, path->mnt, au_dir_roflags, current_cred());
+	file = vfsub_dentry_open(path, au_dir_roflags);
 	dentry = (void *)file;
 	if (IS_ERR(file))
 		goto out;
 
 	dentry = ERR_PTR(-ENOMEM);
-	arg.name = __getname();
+	arg.name = __getname_gfp(GFP_NOFS);
 	if (unlikely(!arg.name))
 		goto out_file;
 	arg.ino = ino;
@@ -395,11 +386,11 @@ static struct dentry *au_lkup_by_ino(struct path *path, ino_t ino,
 		dentry = ERR_PTR(-ENOENT);
 	}
 
- out_name:
+out_name:
 	__putname(arg.name);
- out_file:
+out_file:
 	fput(file);
- out:
+out:
 	if (unlikely(nsi_lock
 		     && si_nfsd_read_lock(parent->d_sb, nsi_lock) < 0))
 		if (!IS_ERR(dentry)) {
@@ -430,7 +421,7 @@ static struct dentry *decode_by_dir_ino(struct super_block *sb, ino_t ino,
 	dentry = au_lkup_by_ino(&path, ino, nsi_lock);
 	path_put(&path);
 
- out:
+out:
 	AuTraceErrPtr(dentry);
 	return dentry;
 }
@@ -471,7 +462,7 @@ static char *au_build_path(struct dentry *h_parent, struct path *h_rootpath,
 	if (n != 1)
 		p[strlen(p)] = '/';
 
- out:
+out:
 	AuTraceErrPtr(p);
 	return p;
 }
@@ -541,19 +532,19 @@ struct dentry *decode_by_path(struct super_block *sb, aufs_bindex_t bindex,
 	else
 		dentry = dget(path.dentry);
 
- out_path:
+out_path:
 	path_put(&path);
- out_relock:
+out_relock:
 	if (unlikely(si_nfsd_read_lock(sb, nsi_lock) < 0))
 		if (!IS_ERR(dentry)) {
 			dput(dentry);
 			dentry = ERR_PTR(-ESTALE);
 		}
- out_pathname:
+out_pathname:
 	free_page((unsigned long)pathname);
- out_h_parent:
+out_h_parent:
 	dput(h_parent);
- out:
+out:
 	/* au_br_put(br); */
 	AuTraceErrPtr(dentry);
 	return dentry;
@@ -614,15 +605,15 @@ aufs_fh_to_dentry(struct super_block *sb, struct fid *fid, int fh_len,
 		/* todo?: make it ESTALE */
 		goto out_unlock;
 
- accept:
+accept:
 	if (dentry->d_inode->i_generation == fh[Fh_igen])
 		goto out_unlock; /* success */
 
 	dput(dentry);
 	dentry = ERR_PTR(-ESTALE);
- out_unlock:
+out_unlock:
 	si_read_unlock(sb);
- out:
+out:
 	AuTraceErrPtr(dentry);
 	return dentry;
 }
@@ -644,7 +635,7 @@ static struct dentry *aufs_fh_to_parent(struct super_block *sb, struct fid *fid,
 		parent = decode_by_path(sb, au_br_index(sb, fh[Fh_br_id]),
 					dir_ino, fh, fh_len);
 
- out:
+out:
 	AuTraceErrPtr(parent);
 	return parent;
 }
@@ -727,13 +718,13 @@ static int aufs_encode_fh(struct dentry *dentry, __u32 *fh, int *max_len,
 	else
 		AuWarn1("%s encode_fh failed\n", au_sbtype(h_sb));
 
- out_dput:
+out_dput:
 	dput(h_parent);
- out_unlock:
+out_unlock:
 	di_read_unlock(parent, !AuLock_IR);
 	dput(parent);
 	aufs_read_unlock(dentry, AuLock_IR);
- out:
+out:
 	if (unlikely(err < 0))
 		err = 255;
 	return err;
@@ -750,7 +741,7 @@ static int aufs_commit_metadata(struct inode *inode)
 	int (*f)(struct inode *inode);
 
 	sb = inode->i_sb;
-	si_read_lock(sb, AuLock_FLUSH);
+	si_read_lock(sb, AuLock_FLUSH | AuLock_NOPLMW);
 	ii_write_lock_child(inode);
 	bindex = au_ibstart(inode);
 	AuDebugOn(bindex < 0);

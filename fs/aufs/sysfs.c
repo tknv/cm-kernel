@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,7 +26,30 @@
 #include <linux/sysfs.h>
 #include "aufs.h"
 
+#ifdef CONFIG_AUFS_FS_MODULE
+/* this entry violates the "one line per file" policy of sysfs */
+static ssize_t config_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	ssize_t err;
+	static char *conf =
+/* this file is generated at compiling */
+#include "conf.str"
+		;
+
+	err = snprintf(buf, PAGE_SIZE, conf);
+	if (unlikely(err >= PAGE_SIZE))
+		err = -EFBIG;
+	return err;
+}
+
+static struct kobj_attribute au_config_attr = __ATTR_RO(config);
+#endif
+
 static struct attribute *au_attr[] = {
+#ifdef CONFIG_AUFS_FS_MODULE
+	&au_config_attr.attr,
+#endif
 	NULL,	/* need to NULL terminate the list of attributes */
 };
 
@@ -41,6 +64,8 @@ struct attribute_group *sysaufs_attr_group = &sysaufs_attr_group_body;
 int sysaufs_si_xi_path(struct seq_file *seq, struct super_block *sb)
 {
 	int err;
+
+	SiMustAnyLock(sb);
 
 	err = 0;
 	if (au_opt_test(au_mntflags(sb), XINO)) {
@@ -155,7 +180,7 @@ ssize_t sysaufs_si_show(struct kobject *kobj, struct attribute *attr,
 	}
 	BUG();
 
- out_seq:
+out_seq:
 	if (!err) {
 		err = seq->count;
 		/* sysfs limit */
@@ -163,9 +188,9 @@ ssize_t sysaufs_si_show(struct kobject *kobj, struct attribute *attr,
 			err = -EFBIG;
 	}
 	kfree(seq);
- out_unlock:
+out_unlock:
 	si_read_unlock(sb);
- out:
+out:
 	return err;
 }
 
@@ -220,6 +245,7 @@ void sysaufs_brs_add(struct super_block *sb, aufs_bindex_t bindex)
 			 "%d", bindex);
 		err = sysfs_create_file(kobj, &br->br_attr);
 		if (unlikely(err))
-			AuWarn("failed %s under sysfs(%d)\n", br->br_name, err);
+			pr_warning("failed %s under sysfs(%d)\n",
+				   br->br_name, err);
 	}
 }

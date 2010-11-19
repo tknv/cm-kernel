@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,12 +29,16 @@
 #include <linux/bug.h>
 /* #include <linux/err.h> */
 #include <linux/init.h>
+#include <linux/module.h>
+#include <linux/kallsyms.h>
 /* #include <linux/kernel.h> */
 #include <linux/delay.h>
 /* #include <linux/kd.h> */
-/* #include <linux/vt_kern.h> */
+#include <linux/vt_kern.h>
 #include <linux/sysrq.h>
 #include <linux/aufs_type.h>
+
+#include <asm/system.h>
 
 #ifdef CONFIG_AUFS_DEBUG
 #define AuDebugOn(a)		BUG_ON(a)
@@ -53,39 +57,30 @@ static inline int au_debug_test(void)
 }
 #else
 #define AuDebugOn(a)		do {} while (0)
-#define au_debug()		do {} while (0)
-static inline int au_debug_test(void)
-{
-	return 0;
-}
+AuStubVoid(au_debug, int n)
+AuStubInt0(au_debug_test, void)
 #endif /* CONFIG_AUFS_DEBUG */
 
 /* ---------------------------------------------------------------------- */
 
 /* debug print */
 
-#define AuDpri(lvl, fmt, ...) \
-	printk(lvl AUFS_NAME " %s:%d:%s[%d]: " fmt, \
-	       __func__, __LINE__, current->comm, current->pid, ##__VA_ARGS__)
 #define AuDbg(fmt, ...) do { \
 	if (au_debug_test()) \
-		AuDpri(KERN_DEBUG, "DEBUG: " fmt, ##__VA_ARGS__); \
+		pr_debug("DEBUG: " fmt, ##__VA_ARGS__); \
 } while (0)
 #define AuLabel(l)		AuDbg(#l "\n")
-#define AuInfo(fmt, ...)	AuDpri(KERN_INFO, fmt, ##__VA_ARGS__)
-#define AuWarn(fmt, ...)	AuDpri(KERN_WARNING, fmt, ##__VA_ARGS__)
-#define AuErr(fmt, ...)		AuDpri(KERN_ERR, fmt, ##__VA_ARGS__)
-#define AuIOErr(fmt, ...)	AuErr("I/O Error, " fmt, ##__VA_ARGS__)
+#define AuIOErr(fmt, ...)	pr_err("I/O Error, " fmt, ##__VA_ARGS__)
 #define AuWarn1(fmt, ...) do { \
 	static unsigned char _c; \
 	if (!_c++) \
-		AuWarn(fmt, ##__VA_ARGS__); \
+		pr_warning(fmt, ##__VA_ARGS__); \
 } while (0)
 
 #define AuErr1(fmt, ...) do { \
 	static unsigned char _c; \
 	if (!_c++) \
-		AuErr(fmt, ##__VA_ARGS__); \
+		pr_err(fmt, ##__VA_ARGS__); \
 } while (0)
 
 #define AuIOErr1(fmt, ...) do { \
@@ -97,7 +92,7 @@ static inline int au_debug_test(void)
 #define AuUnsupportMsg	"This operation is not supported." \
 			" Please report this application to aufs-users ML."
 #define AuUnsupport(fmt, ...) do { \
-	AuErr(AuUnsupportMsg "\n" fmt, ##__VA_ARGS__); \
+	pr_err(AuUnsupportMsg "\n" fmt, ##__VA_ARGS__); \
 	dump_stack(); \
 } while (0)
 
@@ -141,8 +136,8 @@ void au_dbg_iattr(struct iattr *ia);
 void au_dbg_verify_dir_parent(struct dentry *dentry, unsigned int sigen);
 void au_dbg_verify_nondir_parent(struct dentry *dentry, unsigned int sigen);
 void au_dbg_verify_gen(struct dentry *parent, unsigned int sigen);
-void au_dbg_verify_hf(struct au_finfo *finfo);
 void au_dbg_verify_kthread(void);
+void au_dbg_verify_wkq(void);
 
 int __init au_debug_init(void);
 void au_debug_sbinfo_init(struct au_sbinfo *sbinfo);
@@ -190,38 +185,28 @@ void au_debug_sbinfo_init(struct au_sbinfo *sbinfo);
 	AuDbg("ia_valid 0x%x\n", (ia)->ia_valid); \
 	au_dbg_iattr(ia); \
 } while (0)
-#else
-static inline void au_dbg_verify_dir_parent(struct dentry *dentry,
-					    unsigned int sigen)
-{
-	/* empty */
-}
-static inline void au_dbg_verify_nondir_parent(struct dentry *dentry,
-					       unsigned int sigen)
-{
-	/* empty */
-}
-static inline void au_dbg_verify_gen(struct dentry *parent, unsigned int sigen)
-{
-	/* empty */
-}
-static inline void au_dbg_verify_hf(struct au_finfo *finfo)
-{
-	/* empty */
-}
-static inline void au_dbg_verify_kthread(void)
-{
-	/* empty */
-}
 
-static inline int au_debug_init(void)
-{
-	return 0;
-}
-static inline void au_debug_sbinfo_init(struct au_sbinfo *sbinfo)
-{
-	/* empty */
-}
+#define AuDbgSym(addr) do {				\
+	char sym[KSYM_SYMBOL_LEN];			\
+	sprint_symbol(sym, (unsigned long)addr);	\
+	AuDbg("%s\n", sym);				\
+} while (0)
+
+#define AuInfoSym(addr) do {				\
+	char sym[KSYM_SYMBOL_LEN];			\
+	sprint_symbol(sym, (unsigned long)addr);	\
+	AuInfo("%s\n", sym);				\
+} while (0)
+#else
+AuStubVoid(au_dbg_verify_dir_parent, struct dentry *dentry, unsigned int sigen)
+AuStubVoid(au_dbg_verify_nondir_parent, struct dentry *dentry,
+	   unsigned int sigen)
+AuStubVoid(au_dbg_verify_gen, struct dentry *parent, unsigned int sigen)
+AuStubVoid(au_dbg_verify_kthread, void)
+AuStubVoid(au_dbg_verify_wkq, void)
+AuStubInt0(__init au_debug_init, void)
+AuStubVoid(au_debug_sbinfo_init, struct au_sbinfo *sbinfo)
+
 #define AuDbgWhlist(w)		do {} while (0)
 #define AuDbgVdir(v)		do {} while (0)
 #define AuDbgInode(i)		do {} while (0)
@@ -231,6 +216,8 @@ static inline void au_debug_sbinfo_init(struct au_sbinfo *sbinfo)
 #define AuDbgSleep(sec)		do {} while (0)
 #define AuDbgSleepJiffy(jiffy)	do {} while (0)
 #define AuDbgIAttr(ia)		do {} while (0)
+#define AuDbgSym(addr)		do {} while (0)
+#define AuInfoSym(addr)		do {} while (0)
 #endif /* CONFIG_AUFS_DEBUG */
 
 /* ---------------------------------------------------------------------- */
@@ -245,16 +232,13 @@ void au_sysrq_fin(void);
 	handle_sysrq('w', vc_cons[fg_console].d->vc_tty); \
 } while (0)
 #else
-#define au_dbg_blocked()	do {} while (0)
+AuStubVoid(au_dbg_blocked, void)
 #endif
 
 #else
-static inline int au_sysrq_init(void)
-{
-	return 0;
-}
-#define au_sysrq_fin()		do {} while (0)
-#define au_dbg_blocked()	do {} while (0)
+AuStubInt0(__init au_sysrq_init, void)
+AuStubVoid(au_sysrq_fin, void)
+AuStubVoid(au_dbg_blocked, void)
 #endif /* CONFIG_AUFS_MAGIC_SYSRQ */
 
 #endif /* __KERNEL__ */

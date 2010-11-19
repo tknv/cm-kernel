@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2009 Junjiro R. Okajima
+ * Copyright (C) 2005-2010 Junjiro R. Okajima
  *
  * This program, aufs is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -42,7 +42,7 @@ void au_cpup_attr_timesizes(struct inode *inode)
 
 	h_inode = au_h_iptr(inode, au_ibstart(inode));
 	fsstack_copy_attr_times(inode, h_inode);
-	vfsub_copy_inode_size(inode, h_inode);
+	fsstack_copy_inode_size(inode, h_inode);
 }
 
 void au_cpup_attr_nlink(struct inode *inode, int force)
@@ -141,7 +141,7 @@ void au_dtime_revert(struct au_dtime *dt)
 
 	err = vfsub_notify_change(&dt->dt_h_path, &attr);
 	if (unlikely(err))
-		AuWarn("restoring timestamps failed(%d). ignored\n", err);
+		pr_warning("restoring timestamps failed(%d). ignored\n", err);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -312,7 +312,7 @@ int au_copy_file(struct file *dst, struct file *src, loff_t len)
 	else
 		free_page((unsigned long)buf);
 
- out:
+out:
 	return err;
 }
 
@@ -367,13 +367,13 @@ static int au_cp_regular(struct dentry *dentry, aufs_bindex_t bdst,
 	IMustLock(file[SRC].dentry->d_inode);
 	err = au_copy_file(file[DST].file, file[SRC].file, len);
 
- out_dst:
+out_dst:
 	fput(file[DST].file);
 	au_sbr_put(sb, file[DST].bindex);
- out_src:
+out_src:
 	fput(file[SRC].file);
 	au_sbr_put(sb, file[SRC].bindex);
- out:
+out:
 	return err;
 }
 
@@ -400,7 +400,7 @@ static int au_do_cpup_regular(struct dentry *dentry, aufs_bindex_t bdst,
 		err = -EIO;
 	}
 
- out:
+out:
 	return err;
 }
 
@@ -409,31 +409,33 @@ static int au_do_cpup_symlink(struct path *h_path, struct dentry *h_src,
 {
 	int err, symlen;
 	mm_segment_t old_fs;
-	char *sym;
+	union {
+		char *k;
+		char __user *u;
+	} sym;
 
 	err = -ENOSYS;
 	if (unlikely(!h_src->d_inode->i_op->readlink))
 		goto out;
 
 	err = -ENOMEM;
-	sym = __getname();
-	if (unlikely(!sym))
+	sym.k = __getname_gfp(GFP_NOFS);
+	if (unlikely(!sym.k))
 		goto out;
 
 	old_fs = get_fs();
 	set_fs(KERNEL_DS);
-	symlen = h_src->d_inode->i_op->readlink(h_src, (char __user *)sym,
-						PATH_MAX);
+	symlen = h_src->d_inode->i_op->readlink(h_src, sym.u, PATH_MAX);
 	err = symlen;
 	set_fs(old_fs);
 
 	if (symlen > 0) {
-		sym[symlen] = 0;
-		err = vfsub_symlink(h_dir, h_path, sym);
+		sym.k[symlen] = 0;
+		err = vfsub_symlink(h_dir, h_path, sym.k);
 	}
-	__putname(sym);
+	__putname(sym.k);
 
- out:
+out:
 	return err;
 }
 
@@ -607,7 +609,7 @@ static int au_cpup_single(struct dentry *dentry, aufs_bindex_t bdst,
 		} else
 			/* todo: cpup_wh_file? */
 			/* udba work */
-			au_update_brange(inode, 1);
+			au_update_ibrange(inode, /*do_put_zero*/1);
 	}
 
 	old_ibstart = au_ibstart(inode);
@@ -620,8 +622,14 @@ static int au_cpup_single(struct dentry *dentry, aufs_bindex_t bdst,
 	err = cpup_iattr(dentry, bdst, h_src);
 	isdir = S_ISDIR(dst_inode->i_mode);
 	if (!err) {
-		if (bdst < old_ibstart)
+		if (bdst < old_ibstart) {
+			if (S_ISREG(inode->i_mode)) {
+				err = au_dy_iaop(inode, bdst, dst_inode);
+				if (unlikely(err))
+					goto out_rev;
+			}
 			au_set_ibstart(inode, bdst);
+		}
 		au_set_h_iptr(inode, bdst, au_igrab(dst_inode),
 			      au_hi_flags(inode, isdir));
 		mutex_unlock(&dst_inode->i_mutex);
@@ -633,6 +641,7 @@ static int au_cpup_single(struct dentry *dentry, aufs_bindex_t bdst,
 	}
 
 	/* revert */
+out_rev:
 	h_path.dentry = h_parent;
 	mutex_unlock(&dst_inode->i_mutex);
 	au_dtime_store(&dt, dst_parent, &h_path);
@@ -647,7 +656,7 @@ static int au_cpup_single(struct dentry *dentry, aufs_bindex_t bdst,
 		err = -EIO;
 	}
 
- out:
+out:
 	dput(dst_parent);
 	return err;
 }
@@ -809,8 +818,7 @@ static int au_do_cpup_wh(struct dentry *dentry, aufs_bindex_t bdst,
 	hdp[0 + bdst].hd_dentry = wh_dentry;
 	h_d_start = hdp[0 + bstart].hd_dentry;
 	if (file)
-		hdp[0 + bstart].hd_dentry
-			= au_h_fptr(file, au_fbstart(file))->f_dentry;
+		hdp[0 + bstart].hd_dentry = au_hf_top(file)->f_dentry;
 	err = au_cpup_single(dentry, bdst, bstart, len, !AuCpup_DTIME,
 			     /*h_parent*/NULL);
 	if (!err && file) {
@@ -861,9 +869,9 @@ static int au_cpup_wh(struct dentry *dentry, aufs_bindex_t bdst, loff_t len,
 	au_dtime_revert(&dt);
 	au_set_hi_wh(dentry->d_inode, bdst, wh_dentry);
 
- out_wh:
+out_wh:
 	dput(wh_dentry);
- out:
+out:
 	dput(parent);
 	return err;
 }
@@ -907,7 +915,7 @@ int au_sio_cpup_wh(struct dentry *dentry, aufs_bindex_t bdst, loff_t len,
 
 		/* this temporary unlock is safe */
 		if (file)
-			h_dentry = au_h_fptr(file, au_fbstart(file))->f_dentry;
+			h_dentry = au_hf_top(file)->f_dentry;
 		else
 			h_dentry = au_h_dptr(dentry, au_dbstart(dentry));
 		h_inode = h_dentry->d_inode;
@@ -1009,7 +1017,7 @@ int au_cp_dirs(struct dentry *dentry, aufs_bindex_t bdst,
 			break;
 	}
 
- out:
+out:
 	dput(parent);
 	return err;
 }
@@ -1045,7 +1053,7 @@ int au_test_and_cpup_dirs(struct dentry *dentry, aufs_bindex_t bdst)
 		err = au_cpup_dirs(dentry, bdst);
 	di_downgrade_lock(parent, AuLock_IR);
 
- out:
+out:
 	dput(parent);
 	return err;
 }
